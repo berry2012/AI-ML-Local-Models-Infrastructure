@@ -22,6 +22,11 @@ Parameters:
       - c5.xlarge
       - c5.2xlarge
       - c5.4xlarge
+      - g6f.large
+      - g6.xlarge
+      - g6.2xlarge
+      - g5.xlarge
+      - inf1.xlarge
   
   KeyPairName:
     Type: AWS::EC2::KeyPair::KeyName
