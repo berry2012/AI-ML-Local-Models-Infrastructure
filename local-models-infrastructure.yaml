@@ -1,0 +1,778 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure for local AI/ML models with FSx Lustre and EC2'
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Select the VPC where resources will be deployed
+    
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Select the subnet where EC2 instance and FSx will be deployed
+    
+  InstanceType:
+    Type: String
+    Default: m5.xlarge
+    Description: EC2 instance type
+    AllowedValues:
+      - m5.large
+      - m5.xlarge
+      - m5.2xlarge
+      - m5.4xlarge
+      - c5.xlarge
+      - c5.2xlarge
+      - c5.4xlarge
+  
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair to enable SSH access
+  
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+    Description: Latest Amazon Linux 2023 AMI ID from SSM Parameter Store
+
+Resources:
+  # Security Group for EC2 instance
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for AI/ML EC2 instance
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH access
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8999
+          CidrIp: 0.0.0.0/0
+          Description: Model serving ports
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: AI-ML-SecurityGroup
+
+  # Security Group for FSx Lustre
+  FSxSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for FSx Lustre
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 988
+          ToPort: 988
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+          Description: Lustre traffic from EC2
+        - IpProtocol: tcp
+          FromPort: 1021
+          ToPort: 1023
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+          Description: Lustre traffic from EC2
+      Tags:
+        - Key: Name
+          Value: FSx-Lustre-SecurityGroup
+
+  # Security Group Ingress Rule for FSx self-reference (created after the security group)
+  FSxSelfReferenceRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref FSxSecurityGroup
+      IpProtocol: tcp
+      FromPort: 988
+      ToPort: 988
+      SourceSecurityGroupId: !Ref FSxSecurityGroup
+      Description: Lustre LNET traffic between FSx nodes
+
+  # FSx Lustre File System
+  FSxLustreFileSystem:
+    Type: AWS::FSx::FileSystem
+    Properties:
+      FileSystemType: LUSTRE
+      StorageCapacity: 2400  # 2.4 TiB
+      FileSystemTypeVersion: 2.15
+      SubnetIds:
+        - !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref FSxSecurityGroup
+      LustreConfiguration:
+        DeploymentType: PERSISTENT_1
+        PerUnitStorageThroughput: 50  # MB/s/TiB
+        DataCompressionType: LZ4
+      Tags:
+        - Key: Name
+          Value: AI-ML-Models-FSx
+
+  # IAM Role for EC2 instance
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: FSxAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - fsx:DescribeFileSystems
+                  - fsx:DescribeFileSystemAliases
+                Resource: '*'
+        - PolicyName: SSMDocumentAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetDocument
+                  - ssm:DescribeDocument
+                  - ssm:ListDocuments
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: AI-ML-EC2-Role
+
+  # Instance Profile
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # SSM Document for Model Downloads
+  ModelDownloadDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Command
+      DocumentFormat: YAML
+      Name: !Sub "${AWS::StackName}-ModelDownload"
+      Content:
+        schemaVersion: '2.2'
+        description: Download AI/ML models to FSx Lustre
+        parameters:
+          fsxDnsName:
+            type: String
+            description: FSx Lustre DNS name
+        mainSteps:
+          - action: aws:runShellScript
+            name: setupEnvironment
+            inputs:
+              runCommand:
+                - |
+                  #!/bin/bash
+                  set -e
+                  
+                  # Colors for output
+                  RED='\033[0;31m'
+                  GREEN='\033[0;32m'
+                  YELLOW='\033[1;33m'
+                  BLUE='\033[0;34m'
+                  NC='\033[0m' # No Color
+                  
+                  # Configuration
+                  FSX_MOUNT_POINT="/fsx"
+                  MODELS_DIR="$FSX_MOUNT_POINT/models"
+                  
+                  # Function to print colored output
+                  print_status() {
+                      echo -e "${BLUE}[INFO]${NC} $1"
+                  }
+                  
+                  print_success() {
+                      echo -e "${GREEN}[SUCCESS]${NC} $1"
+                  }
+                  
+                  print_warning() {
+                      echo -e "${YELLOW}[WARNING]${NC} $1"
+                  }
+                  
+                  print_error() {
+                      echo -e "${RED}[ERROR]${NC} $1"
+                  }
+                  
+                  print_status "Starting environment setup..."
+                  
+                  # Update system
+                  yum update -y
+                  
+                  # Install required packages
+                  yum install -y python3-pip git 
+                  dnf install -y lustre-client
+                  
+                  # Install Python packages
+                  pip3 install --upgrade pip
+                  pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+                  pip3 install transformers accelerate huggingface_hub gpt4all
+                  
+                  # Install Hugging Face CLI system-wide
+                  pip3 install --upgrade huggingface_hub[cli]
+                  
+                  print_success "Package installation completed"
+                  
+                  # Setup FSx mounting
+                  FSX_DNS="{{ fsxDnsName }}"
+                  
+                  print_status "Setting up FSx Lustre mount..."
+                  
+                  # Create mount point
+                  mkdir -p $FSX_MOUNT_POINT
+                  
+                  # Check if already mounted
+                  if mountpoint -q $FSX_MOUNT_POINT; then
+                      print_success "FSx is already mounted at $FSX_MOUNT_POINT"
+                  else
+                      # Try to mount FSx with retries
+                      print_status "Attempting to mount FSx Lustre: $FSX_DNS"
+                      MAX_RETRIES=10
+                      RETRY_COUNT=0
+                      
+                      while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+                          print_status "Mount attempt $((RETRY_COUNT + 1))/$MAX_RETRIES..."
+                          
+                          if mount -t lustre $FSX_DNS@tcp:/fsx $FSX_MOUNT_POINT; then
+                              chown -R ec2-user:ec2-user /fsx
+                              print_success "FSx mounted successfully!"
+                              break
+                          else
+                              print_warning "Mount failed, waiting 30 seconds before retry..."
+                              sleep 30
+                              RETRY_COUNT=$((RETRY_COUNT + 1))
+                          fi
+                      done
+                      
+                      if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+                          print_error "Failed to mount FSx after $MAX_RETRIES attempts"
+                          exit 1
+                      fi
+                  fi
+                  
+                  # Verify mount
+                  if ! mountpoint -q $FSX_MOUNT_POINT; then
+                      print_error "FSx is not properly mounted"
+                      exit 1
+                  fi
+                  
+                  print_success "FSx mount verified successfully"
+                  df -h $FSX_MOUNT_POINT
+                  
+                  # Add to fstab for persistent mounting
+                  if ! grep -q "$FSX_DNS@tcp:/fsx" /etc/fstab; then
+                      print_status "Adding FSx to /etc/fstab for persistent mounting..."
+                      echo "$FSX_DNS@tcp:/fsx $FSX_MOUNT_POINT lustre defaults,_netdev 0 0" >> /etc/fstab
+                  fi
+                  
+                  # Create directories for models
+                  print_status "Creating model directories..."
+                  mkdir -p $MODELS_DIR/{gpt4all,gpt-oss-20b,deepseek-r1,mistral-7b}
+                  
+                  # Set permissions
+                  chmod -R 755 $MODELS_DIR
+                  chown -R ec2-user:ec2-user $MODELS_DIR
+                  
+                  # Verify directories were created
+                  print_status "Model directory structure:"
+                  ls -la $MODELS_DIR/
+                  
+                  print_success "Environment setup completed successfully!"
+          - action: aws:runShellScript
+            name: downloadModels
+            inputs:
+              runCommand:
+                - |
+                  #!/bin/bash
+                  set -e
+                  
+                  # Colors for output
+                  RED='\033[0;31m'
+                  GREEN='\033[0;32m'
+                  YELLOW='\033[1;33m'
+                  BLUE='\033[0;34m'
+                  NC='\033[0m' # No Color
+                  
+                  # Configuration
+                  FSX_MOUNT_POINT="/fsx"
+                  MODELS_DIR="$FSX_MOUNT_POINT/models"
+                  
+                  # Function to print colored output
+                  print_status() {
+                      echo -e "${BLUE}[INFO]${NC} $1"
+                  }
+                  
+                  print_success() {
+                      echo -e "${GREEN}[SUCCESS]${NC} $1"
+                  }
+                  
+                  print_warning() {
+                      echo -e "${YELLOW}[WARNING]${NC} $1"
+                  }
+                  
+                  print_error() {
+                      echo -e "${RED}[ERROR]${NC} $1"
+                  }
+                  
+                  print_status "Starting model downloads..."
+                  
+                  # Verify FSx is still mounted
+                  if ! mountpoint -q $FSX_MOUNT_POINT; then
+                      print_warning "FSx is not mounted, attempting to remount..."
+                      mount -t lustre {{ fsxDnsName }}@tcp:/fsx $FSX_MOUNT_POINT
+                  fi
+                  
+                  # Verify directories exist
+                  if [ ! -d "$MODELS_DIR" ]; then
+                      print_warning "Models directory doesn't exist, creating..."
+                      mkdir -p $MODELS_DIR/{gpt4all,gpt-oss-20b,deepseek-r1,mistral-7b}
+                      chmod -R 755 $MODELS_DIR
+                      chown -R ec2-user:ec2-user $MODELS_DIR
+                  fi
+                  
+                  # Download GPT4All model
+                  print_status "Downloading GPT4All Llama3 model..."
+                  if [ ! -d "$MODELS_DIR/gpt4all" ]; then
+                      print_error "GPT4All directory not found: $MODELS_DIR/gpt4all"
+                      exit 1
+                  fi
+                  
+                  cd $MODELS_DIR/gpt4all
+                  
+                  # Create Python script for GPT4All download
+                  cat > /tmp/download_gpt4all.py << 'PYTHON_EOF'
+                  from gpt4all import GPT4All
+                  import os
+                  
+                  print("Downloading GPT4All Llama3 model...")
+                  model = GPT4All("Meta-Llama-3-8B-Instruct.Q4_0.gguf", model_path="/fsx/models/gpt4all/")
+                  print("GPT4All model downloaded successfully!")
+                  
+                  # Test the model
+                  print("Testing the model...")
+                  with model.chat_session():
+                      response = model.generate("Hello, how are you?", max_tokens=50)
+                      print(f"Test response: {response}")
+                  PYTHON_EOF
+                  
+                  python3 /tmp/download_gpt4all.py
+                  rm -f /tmp/download_gpt4all.py
+                  
+                  print_success "GPT4All model download completed"
+                  du -sh $MODELS_DIR/gpt4all/
+                  
+                  # Download GPT-OSS-20B model
+                  print_status "Downloading GPT-OSS-20B model..."
+                  if [ ! -d "$MODELS_DIR/gpt-oss-20b" ]; then
+                      print_error "GPT-OSS-20B directory not found: $MODELS_DIR/gpt-oss-20b"
+                      exit 1
+                  fi
+                  
+                  # Create Hugging Face cache directory with proper permissions
+                  mkdir -p /home/ec2-user/.cache/huggingface
+                  chmod 755 /home/ec2-user/.cache/huggingface
+                  chown -R ec2-user:ec2-user /home/ec2-user/.cache/huggingface
+                  
+                  cd $MODELS_DIR/gpt-oss-20b
+                  hf download openai/gpt-oss-20b --include "original/*" --local-dir ./
+                  
+                  print_success "GPT-OSS-20B model download completed"
+                  du -sh $MODELS_DIR/gpt-oss-20b/
+                  
+                  # Download DeepSeek R1 model
+                  print_status "Downloading DeepSeek R1-Distill-Llama-8B model..."
+                  if [ ! -d "$MODELS_DIR/deepseek-r1" ]; then
+                      print_error "DeepSeek R1 directory not found: $MODELS_DIR/deepseek-r1"
+                      exit 1
+                  fi
+                  
+                  cd $MODELS_DIR/deepseek-r1
+                  hf download deepseek-ai/DeepSeek-R1-Distill-Llama-8B --local-dir ./
+                  
+                  print_success "DeepSeek R1 model download completed"
+                  du -sh $MODELS_DIR/deepseek-r1/
+                  
+                  # Download Mistral model
+                  print_status "Downloading Mistral-7B-Instruct-v0.2 model..."
+                  if [ ! -d "$MODELS_DIR/mistral-7b" ]; then
+                      print_error "Mistral-7B directory not found: $MODELS_DIR/mistral-7b"
+                      exit 1
+                  fi
+                  
+                  cd $MODELS_DIR/mistral-7b
+                  hf download mistralai/Mistral-7B-Instruct-v0.2 --local-dir ./
+                  
+                  print_success "Mistral-7B model download completed"
+                  du -sh $MODELS_DIR/mistral-7b/
+                  
+                  print_success "All models downloaded successfully!"
+                  echo "Checking final directory structure:"
+                  du -sh $MODELS_DIR/*
+          - action: aws:runShellScript
+            name: createScripts
+            inputs:
+              runCommand:
+                - |
+                  #!/bin/bash
+                  
+                  # Create usage examples script
+                  cat > /home/ec2-user/model_examples.py << 'EOF'
+                  #!/usr/bin/env python3
+                  """
+                  Example usage scripts for the downloaded AI/ML models
+                  """
+                  
+                  def test_gpt4all():
+                      """Test GPT4All model"""
+                      from gpt4all import GPT4All
+                      
+                      model_path = "/fsx/models/gpt4all/Meta-Llama-3-8B-Instruct.Q4_0.gguf"
+                      model = GPT4All(model_path, allow_download=False)
+                      
+                      with model.chat_session():
+                          response = model.generate("How can I run LLMs efficiently on my laptop?", max_tokens=1024)
+                          print("GPT4All Response:", response)
+                  
+                  def test_gpt_oss():
+                      """Test GPT-OSS model"""
+                      print("To use GPT-OSS-20B:")
+                      print("cd /fsx/models/gpt-oss-20b")
+                      print("python -m gpt_oss.chat model/")
+                  
+                  def test_transformers_models():
+                      """Test Hugging Face transformers models"""
+                      from transformers import AutoTokenizer, AutoModelForCausalLM
+                      
+                      # Example for Mistral
+                      print("Loading Mistral model...")
+                      tokenizer = AutoTokenizer.from_pretrained("/fsx/models/mistral-7b")
+                      model = AutoModelForCausalLM.from_pretrained("/fsx/models/mistral-7b")
+                      
+                      inputs = tokenizer("Hello, how are you?", return_tensors="pt")
+                      outputs = model.generate(**inputs, max_length=50)
+                      response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+                      print("Mistral Response:", response)
+                  
+                  def test_deepseek():
+                      """Test DeepSeek model"""
+                      from transformers import AutoTokenizer, AutoModelForCausalLM
+                      
+                      print("Loading DeepSeek R1 model...")
+                      tokenizer = AutoTokenizer.from_pretrained("/fsx/models/deepseek-r1")
+                      model = AutoModelForCausalLM.from_pretrained("/fsx/models/deepseek-r1")
+                      
+                      inputs = tokenizer("Explain quantum computing in simple terms:", return_tensors="pt")
+                      outputs = model.generate(**inputs, max_length=100)
+                      response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+                      print("DeepSeek Response:", response)
+                  
+                  if __name__ == "__main__":
+                      print("AI/ML Model Testing Examples")
+                      print("============================")
+                      print("Available functions:")
+                      print("- test_gpt4all()")
+                      print("- test_gpt_oss()")
+                      print("- test_transformers_models()")
+                      print("- test_deepseek()")
+                      print()
+                      print("Example usage:")
+                      print("python3 model_examples.py")
+                      print(">>> test_gpt4all()")
+                  EOF
+                  
+                  chmod +x /home/ec2-user/model_examples.py
+                  chown ec2-user:ec2-user /home/ec2-user/model_examples.py
+                  
+                  # Create README file
+                  cat > /home/ec2-user/README_models.md << 'EOF'
+                  # AI/ML Models Setup
+                  
+                  This instance has been configured with FSx Lustre storage for AI/ML models.
+                  
+                  ## Storage Layout
+                  - FSx Lustre mounted at: `/fsx`
+                  - Models directory: `/fsx/models/`
+                  
+                  ## Available Models
+                  1. **GPT4All Llama3**: `/fsx/models/gpt4all/`
+                  2. **GPT-OSS-20B**: `/fsx/models/gpt-oss-20b/`
+                  3. **DeepSeek R1-Distill-Llama-8B**: `/fsx/models/deepseek-r1/`
+                  4. **Mistral-7B-Instruct-v0.2**: `/fsx/models/mistral-7b/`
+                  
+                  ## Usage Examples
+                  
+                  ### GPT4All
+                  ```python
+                  from gpt4all import GPT4All
+                  model = GPT4All("/fsx/models/gpt4all/Meta-Llama-3-8B-Instruct.Q4_0.gguf")
+                  with model.chat_session():
+                      print(model.generate("Your question here", max_tokens=1024))
+                  ```
+                  
+                  ### GPT-OSS-20B
+                  ```bash
+                  cd /fsx/models/gpt-oss-20b
+                  python -m gpt_oss.chat model/
+                  ```
+                  
+                  ### Transformers Models (Mistral, DeepSeek)
+                  ```python
+                  from transformers import AutoTokenizer, AutoModelForCausalLM
+                  
+                  tokenizer = AutoTokenizer.from_pretrained("/fsx/models/mistral-7b")
+                  model = AutoModelForCausalLM.from_pretrained("/fsx/models/mistral-7b")
+                  ```
+                  
+                  ## Testing
+                  Run the example script: `python3 model_examples.py`
+                  
+                  ## Notes
+                  - All models are stored persistently on FSx Lustre
+                  - FSx provides high-performance shared storage
+                  - Models are accessible across instance restarts
+                  EOF
+                  
+                  chown ec2-user:ec2-user /home/ec2-user/README_models.md
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SSMExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                  - ssm:DescribeInstanceInformation
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: ModelDownload-Lambda-Role
+
+  # Lambda Function to trigger SSM document
+  ModelDownloadLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-ModelDownload"
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import urllib3
+          import time
+          
+          def send_response(event, context, response_status, response_data=None, physical_resource_id=None):
+              """Send response to CloudFormation"""
+              response_url = event['ResponseURL']
+              
+              response_body = {
+                  'Status': response_status,
+                  'Reason': f'See CloudWatch Log Stream: {context.log_stream_name}',
+                  'PhysicalResourceId': physical_resource_id or context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': response_data or {}
+              }
+              
+              json_response_body = json.dumps(response_body)
+              
+              headers = {
+                  'content-type': '',
+                  'content-length': str(len(json_response_body))
+              }
+              
+              http = urllib3.PoolManager()
+              try:
+                  response = http.request('PUT', response_url, body=json_response_body, headers=headers)
+                  print(f"Status code: {response.status}")
+              except Exception as e:
+                  print(f"send_response failed: {e}")
+          
+          def lambda_handler(event, context):
+              print(f"Received event: {json.dumps(event)}")
+              
+              try:
+                  request_type = event['RequestType']
+                  
+                  if request_type == 'Delete':
+                      send_response(event, context, 'SUCCESS')
+                      return
+                  
+                  if request_type in ['Create', 'Update']:
+                      # Get parameters from event
+                      properties = event['ResourceProperties']
+                      instance_id = properties['InstanceId']
+                      document_name = properties['DocumentName']
+                      fsx_dns_name = properties['FsxDnsName']
+                      
+                      # Initialize SSM client
+                      ssm = boto3.client('ssm')
+                      
+                      # Wait for instance to be ready
+                      print(f"Waiting for instance {instance_id} to be ready...")
+                      time.sleep(120)  # Wait 2 minutes for instance to boot
+                      
+                      # Send command to instance
+                      print(f"Executing SSM document {document_name} on instance {instance_id}")
+                      response = ssm.send_command(
+                          InstanceIds=[instance_id],
+                          DocumentName=document_name,
+                          Parameters={
+                              'fsxDnsName': [fsx_dns_name]
+                          },
+                          TimeoutSeconds=3600  # 1 hour timeout
+                      )
+                      
+                      command_id = response['Command']['CommandId']
+                      print(f"Command ID: {command_id}")
+                      
+                      # Wait for command to complete (with timeout)
+                      max_wait_time = 3600  # 1 hour
+                      wait_interval = 30    # 30 seconds
+                      elapsed_time = 0
+                      
+                      while elapsed_time < max_wait_time:
+                          try:
+                              result = ssm.get_command_invocation(
+                                  CommandId=command_id,
+                                  InstanceId=instance_id
+                              )
+                              
+                              status = result['Status']
+                              print(f"Command status: {status}")
+                              
+                              if status in ['Success', 'Failed', 'Cancelled', 'TimedOut']:
+                                  if status == 'Success':
+                                      print("Model download completed successfully")
+                                      send_response(event, context, 'SUCCESS', {
+                                          'CommandId': command_id,
+                                          'Status': status
+                                      })
+                                  else:
+                                      print(f"Model download failed with status: {status}")
+                                      print(f"Standard Output: {result.get('StandardOutputContent', 'N/A')}")
+                                      print(f"Standard Error: {result.get('StandardErrorContent', 'N/A')}")
+                                      send_response(event, context, 'FAILED')
+                                  return
+                              
+                              time.sleep(wait_interval)
+                              elapsed_time += wait_interval
+                              
+                          except ssm.exceptions.InvocationDoesNotExist:
+                              print("Command invocation not yet available, waiting...")
+                              time.sleep(wait_interval)
+                              elapsed_time += wait_interval
+                      
+                      # Timeout reached
+                      print("Timeout waiting for command completion")
+                      send_response(event, context, 'FAILED')
+                      
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  send_response(event, context, 'FAILED')
+
+  # EC2 Instance (simplified without UserData)
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 100
+            VolumeType: gp3
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: AI-ML-Models-Instance
+
+  # Custom Resource to trigger model download
+  ModelDownloadTrigger:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: 
+      - EC2Instance
+      - FSxLustreFileSystem
+    Properties:
+      ServiceToken: !GetAtt ModelDownloadLambda.Arn
+      InstanceId: !Ref EC2Instance
+      DocumentName: !Ref ModelDownloadDocument
+      FsxDnsName: !Sub "${FSxLustreFileSystem}.fsx.${AWS::Region}.amazonaws.com"
+
+Outputs:
+  EC2InstanceId:
+    Description: Instance ID of the EC2 instance
+    Value: !Ref EC2Instance
+    Export:
+      Name: !Sub "${AWS::StackName}-EC2InstanceId"
+  
+  EC2PrivateIP:
+    Description: Private IP address of the EC2 instance
+    Value: !GetAtt EC2Instance.PrivateIp
+    Export:
+      Name: !Sub "${AWS::StackName}-EC2PrivateIP"
+  
+  FSxFileSystemId:
+    Description: ID of the FSx Lustre file system
+    Value: !Ref FSxLustreFileSystem
+    Export:
+      Name: !Sub "${AWS::StackName}-FSxFileSystemId"
+  
+  FSxDNSName:
+    Description: DNS name of the FSx Lustre file system
+    Value: !Sub "${FSxLustreFileSystem}.fsx.${AWS::Region}.amazonaws.com"
+    Export:
+      Name: !Sub "${AWS::StackName}-FSxDNSName"
+  
+  SSMDocumentName:
+    Description: Name of the SSM document for model downloads
+    Value: !Ref ModelDownloadDocument
+    Export:
+      Name: !Sub "${AWS::StackName}-SSMDocument"
+  
+  LambdaFunctionName:
+    Description: Name of the Lambda function that triggers model downloads
+    Value: !Ref ModelDownloadLambda
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaFunction"
+  
+  ModelsPath:
+    Description: Path to models on FSx Lustre
+    Value: "/mnt/fsx/models/"
+  
+  ModelDownloadStatus:
+    Description: Check model download status in CloudWatch Logs
+    Value: !Sub "https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#logsV2:log-groups/log-group/$252Faws$252Flambda$252F${ModelDownloadLambda}"
